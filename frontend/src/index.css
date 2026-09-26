@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+/* Design tokens -> usable as Tailwind classes: bg-canvas, text-ink, border-line, ... */
+@theme {
+  --color-canvas: #eef1f5;
+  --color-surface: #ffffff;
+  --color-ink: #1b2433;
+  --color-muted: #5e6a7d;
+  --color-line: #d8dee7;
+  --color-user: #25408f;
+  --color-tool: #0e7c6b;
+  --color-tool-tint: #e2f1ee;
+  --color-danger: #b42318;
+  --color-danger-tint: #fdecea;
+
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-canvas text-ink font-sans antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-user);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
