@@ -1,0 +1,140 @@
+┌─────────────────────────────────────────────────────────────────────┐
+│  CLIENT (React UI / Swagger /docs / curl)                           │
+└───────────────┬─────────────────────────────────────▲───────────────┘
+                │ POST /chat  {"message": "..."}      │ JSON reply
+                ▼                                     │
+┌─────────────────────────────────────────────────────┴───────────────┐
+│  main.py          FastAPI app, CORS, routers                        │
+├─────────────────────────────────────────────────────────────────────┤
+│  api/chat.py      the /chat endpoint: gets DB, history, calls agent │
+├─────────────────────────────────────────────────────────────────────┤
+│  agents/task_agent.py   the agent loop: talks to the LLM            │◄──► LLM (OpenAI/Groq/Ollama)
+├─────────────────────────────────────────────────────────────────────┤
+│  tools/task_tools.py    tools the LLM can ask for                   │
+├─────────────────────────────────────────────────────────────────────┤
+│  services/task_service.py   the ONLY code that touches the DB       │
+├─────────────────────────────────────────────────────────────────────┤
+│  models/task.py + database/database.py   SQLAlchemy → tasks.db      │
+└─────────────────────────────────────────────────────────────────────┘
+
+
+
+Before any request: server startup
+
+uvicorn app.main:app
+      │
+      ├─► lifespan()  (the @asynccontextmanager)
+      │      ├─ init_db()  → creates the "tasks" table in tasks.db if missing
+      │      ├─ logs which LLM model is configured
+      │      └─ yield  → server is now ready and waits for requests
+      │
+      ├─► CORS middleware added   (lets the React app on another port call the API)
+      └─► routers included:  chat.router (/chat)  and  tasks.router (/tasks)
+
+
+
+The full flow of one chat message
+
+ CLIENT
+   │  POST /chat
+   │  {"message": "Delete my task called Learn LangGraph", "conversation_id": "abc"}
+   ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ① FastAPI (main.py)                                                      │
+│    • CORS check                                                          │
+│    • finds the route → chat()  in api/chat.py                            │
+│    • validates body with ChatRequest  (message 1–2000 chars)             │
+│      ✗ invalid → 422 error sent back automatically                       │
+│    • Depends(get_db) → opens a DB Session for THIS request               │
+└──────────────────────────────┬───────────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ② chat()  (api/chat.py)                                                  │
+│    • history = _conversations["abc"]   (earlier messages, or [])         │
+│    • puts the db into a box:  AgentDeps(db=db)                           │
+│    • calls run_task_agent(message, AgentDeps(db=db), history)            │
+└──────────────────────────────┬───────────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ③ run_task_agent()  (agents/task_agent.py)                               │
+│    log  USER: "Delete my task called Learn LangGraph"                    │
+│    task_agent.iter(...)  starts THE AGENT LOOP  ──────────┐              │
+└───────────────────────────────────────────────────────────┼──────────────┘
+                                                            ▼
+        ╔═══════════════════════ AGENT LOOP (PydanticAI) ═══════════════════════╗
+        ║                                                                       ║
+        ║  ┌─────────────────────────────────────────────────────────┐          ║
+        ║  │ Send to LLM:                                            │          ║
+        ║  │   system prompt + today's date + history + user message │          ║
+        ║  │   + list of tools (create/get/list/update/delete_task)  │          ║
+        ║  └──────────────────────────┬──────────────────────────────┘          ║
+        ║                             ▼                                         ║
+        ║                  LLM replies. Which kind?                             ║
+        ║            ┌────────────────┴─────────────────┐                       ║
+        ║            ▼                                  ▼                       ║
+        ║   "call a tool"                        plain text                     ║
+        ║   (ToolCallPart)                       (TextPart)                     ║
+        ║            │                                  │                       ║
+        ║            ▼                                  ▼                       ║
+        ║   ④ run the tool ──(result)──► back to LLM   EXIT LOOP                ║
+        ║            ▲                     │                                    ║
+        ║            └─────── repeat ◄─────┘                                    ║
+        ╚═══════════════════════════════════════════════════════════════════════╝
+
+
+
+Inside "run the tool": what happens in this example
+
+Round 1
+  LLM: "call list_tasks(title_contains='LangGraph')"
+    log  AGENT: LLM chose tool -> list_tasks {'title_contains': 'LangGraph'}
+    │
+    ▼
+  PydanticAI calls:  list_tasks(ctx, title_contains="LangGraph")
+                               │
+                               └─ ctx = the box PydanticAI fills in; ctx.deps.db = the DB session
+    │
+    ▼  tools/task_tools.py
+  log  TOOL: list_tasks(title_contains='LangGraph')
+  task_service.list_tasks(ctx.deps.db, title_contains="LangGraph")
+    │
+    ▼  services/task_service.py
+  SELECT * FROM tasks WHERE title ILIKE '%LangGraph%'
+  log  DATABASE: ...
+    │
+    ▼
+  returns [Task(id=3, "Learn LangGraph", pending)]
+  tool converts it → [TaskOut(...)]  (from_attributes=True makes this work)
+    │
+    ▼
+  result sent back to the LLM
+
+
+Round 2
+  LLM: "call delete_task(task_id=3)"
+    log  AGENT: LLM chose tool -> delete_task {'task_id': 3}
+    ▼
+  delete_task(ctx, task_id=3) → task_service.delete_task(db, 3)
+    ▼
+  DELETE FROM tasks WHERE id = 3;  COMMIT
+  log  DATABASE: Task 3 deleted
+    ▼
+  result sent back to the LLM
+
+
+Round 3
+  LLM: "Done! I deleted 'Learn LangGraph'."   ← plain text, so the loop ends
+
+
+Every layer calls log_step(...), so the whole trip appears in order:
+
+
+USER:      'Delete my task called Learn LangGraph'
+AGENT:     LLM chose tool -> list_tasks {'title_contains': 'LangGraph'}
+TOOL:      list_tasks(title_contains='LangGraph')
+DATABASE:  SELECT ... 1 task(s)
+AGENT:     LLM chose tool -> delete_task {'task_id': 3}
+TOOL:      delete_task(task_id=3)
+DATABASE:  Task 3 deleted
+AGENT:     "Done! I deleted 'Learn LangGraph'."
+Running the server and sending one chat message is the best way to watch this flow happen.
